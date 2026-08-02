@@ -1,0 +1,30 @@
+services:
+  clamav-scheduled-notifier:
+    image: ghcr.io/${GITHUB_OWNER:-outlain}/clamav-scheduled-notifier:${IMAGE_TAG:-latest}
+    container_name: clamav-scheduled-notifier
+    user: "${HELPER_UID:-10001}:${HELPER_GID:-10001}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    environment:
+      CLAMAV_LOG_DIR: /logs
+      STATE_DIR: /state
+      NOTIFIER_POLL_SECONDS: ${NOTIFIER_POLL_SECONDS:-15}
+      NOTIFIER_REPLAY_EXISTING: ${NOTIFIER_REPLAY_EXISTING:-false}
+      TELEGRAM_TIMEOUT_SECONDS: ${TELEGRAM_TIMEOUT_SECONDS:-15}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID in .env}
+    volumes:
+      - ${CLAMAV_LOG_HOST_PATH:-/mnt/media/docker/clamav/logs}:/logs:ro
+      - ${NOTIFIER_STATE_HOST_PATH:-/opt/docker/clamav-notifier/state}:/state:rw
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
