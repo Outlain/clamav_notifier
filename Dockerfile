@@ -1,4 +1,4 @@
-FROM python:3.12.11-alpine3.22
+FROM python:3.14.5-alpine3.22
 
 RUN addgroup -S -g 10001 clamav-helper \
     && adduser -S -D -u 10001 -G clamav-helper -h /home/clamav-helper clamav-helper \
