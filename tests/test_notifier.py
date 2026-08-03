@@ -48,9 +48,11 @@ class NotifierTests(unittest.TestCase):
 
     def test_validates_structured_event_and_directory_service(self) -> None:
         event = module.parse_event(
-            json.dumps(example_event()).encode(), expected_service="web-scan-move"
+            json.dumps(example_event(failure_kind="scan_policy_limit")).encode(),
+            expected_service="web-scan-move",
         )
         self.assertEqual(event["event_id"], "event-1")
+        self.assertEqual(event["failure_kind"], "scan_policy_limit")
         with self.assertRaises(ValueError):
             module.parse_event(
                 json.dumps(example_event()).encode(), expected_service="clamav-scheduled"
@@ -247,8 +249,12 @@ class NotifierTests(unittest.TestCase):
                 connection.close()
 
     def test_message_is_plain_text_and_includes_combined_count(self) -> None:
-        message = module.render_message(module.validate_event(example_event()), 3)
+        message = module.render_message(
+            module.validate_event(example_event(failure_kind="scan_policy_limit")),
+            3,
+        )
         self.assertIn("Occurrences combined: 3", message)
+        self.assertIn("Failure kind: scan_policy_limit", message)
         self.assertNotIn("parse_mode", message)
 
     def test_message_is_bounded_for_telegram(self) -> None:

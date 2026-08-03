@@ -48,6 +48,7 @@ ALLOWED_FIELDS = {
     "action_success",
     "definition_age_seconds",
     "scan_type",
+    "failure_kind",
     "job_id",
     "torrent_hash",
 }
@@ -191,7 +192,7 @@ def validate_event(value: Any, expected_service: str | None = None) -> dict[str,
         item = value[key]
         if key in {"source_path", "destination_path"}:
             clean[key] = _bounded_string(value, key, 4096)
-        elif key in {"threat_name", "scan_type", "job_id", "torrent_hash"}:
+        elif key in {"threat_name", "scan_type", "failure_kind", "job_id", "torrent_hash"}:
             clean[key] = _bounded_string(value, key, 512)
         elif key == "action_success" and isinstance(item, bool):
             clean[key] = item
@@ -375,6 +376,8 @@ def render_message(event: dict[str, Any], repeat_count: int = 1) -> str:
     ]
     if event.get("threat_name"):
         lines.append(f"Threat: {event['threat_name']}")
+    if event.get("failure_kind"):
+        lines.append(f"Failure kind: {event['failure_kind']}")
     if event.get("source_path"):
         lines.append(f"Source: {event['source_path']}")
     if event.get("destination_path"):

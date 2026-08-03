@@ -17,7 +17,7 @@ Producers atomically write one JSON file per event under:
 Every event has `schema_version`, `event_id`, `event_type`, `service`, `severity`,
 UTC `timestamp`, and `message`. Optional bounded fields include `source_path`,
 `destination_path`, `threat_name`, `action_success`, `scan_type`, `job_id`,
-`torrent_hash`, and `definition_age_seconds`. Producers must never place tokens,
+`torrent_hash`, `definition_age_seconds`, and `failure_kind`. Producers must never place tokens,
 passwords, tracker passkeys, or magnet URIs in an event.
 
 The notifier opens regular files with `O_NOFOLLOW`, verifies their identity,
