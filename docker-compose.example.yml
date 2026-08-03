@@ -1,28 +1,41 @@
 services:
-  clamav-scheduled-notifier:
-    image: ghcr.io/${GITHUB_OWNER:-outlain}/clamav-scheduled-notifier:${IMAGE_TAG:-latest}
-    container_name: clamav-scheduled-notifier
+  clamav-notifier:
+    image: ghcr.io/${GITHUB_OWNER:-outlain}/clamav-notifier:${IMAGE_TAG:-latest}
+    container_name: clamav-notifier
     user: "${HELPER_UID:-10001}:${HELPER_GID:-10001}"
     init: true
     restart: unless-stopped
     read_only: true
     environment:
-      CLAMAV_LOG_DIR: /logs
+      EVENTS_DIR: /events
       STATE_DIR: /state
-      NOTIFIER_POLL_SECONDS: ${NOTIFIER_POLL_SECONDS:-15}
-      NOTIFIER_REPLAY_EXISTING: ${NOTIFIER_REPLAY_EXISTING:-false}
+      NOTIFIER_POLL_SECONDS: ${NOTIFIER_POLL_SECONDS:-5}
+      NOTIFIER_AGGREGATION_SECONDS: ${NOTIFIER_AGGREGATION_SECONDS:-30}
+      NOTIFIER_REPEAT_WINDOW_SECONDS: ${NOTIFIER_REPEAT_WINDOW_SECONDS:-900}
+      NOTIFIER_RETENTION_DAYS: ${NOTIFIER_RETENTION_DAYS:-90}
+      NOTIFIER_REJECTED_RETENTION_DAYS: ${NOTIFIER_REJECTED_RETENTION_DAYS:-30}
+      NOTIFIER_MAX_EVENT_BYTES: ${NOTIFIER_MAX_EVENT_BYTES:-131072}
+      NOTIFIER_MAX_FILES_PER_CYCLE: ${NOTIFIER_MAX_FILES_PER_CYCLE:-1000}
+      NOTIFIER_HEALTH_MAX_AGE_SECONDS: ${NOTIFIER_HEALTH_MAX_AGE_SECONDS:-180}
       TELEGRAM_TIMEOUT_SECONDS: ${TELEGRAM_TIMEOUT_SECONDS:-15}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID in .env}
     volumes:
-      - ${CLAMAV_LOG_HOST_PATH:-/mnt/media/docker/clamav/logs}:/logs:ro
-      - ${NOTIFIER_STATE_HOST_PATH:-/opt/docker/clamav-notifier/state}:/state:rw
+      - ${EVENTS_HOST_PATH:-/opt/docker/clamav-shared/events}:/events:rw
+      - ${NOTIFIER_STATE_HOST_PATH:-/opt/docker/clamav-shared/state/notifier}:/state:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
     logging:
       driver: json-file
       options:

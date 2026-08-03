@@ -31,6 +31,25 @@ jobs:
       - name: Build image
         run: docker build --tag "${{ github.event.repository.name }}:test" .
 
+      - name: Run tests in the built image
+        run: docker run --rm --env PYTHONPATH=/usr/local/bin --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python3 "${{ github.event.repository.name }}:test" -m unittest discover -s /workspace/tests -v
+
+      - name: Verify non-root and read-only-root compatibility
+        run: |
+          docker run --rm --entrypoint id "${{ github.event.repository.name }}:test" -u | grep -qx 10001
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m --entrypoint python3 "${{ github.event.repository.name }}:test" -c 'import runpy; runpy.run_path("/usr/local/bin/notifier.py", run_name="not_main")'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Validate arm64 image build
+        run: |
+          docker buildx build --platform linux/arm64 --load --tag "${{ github.event.repository.name }}:test-arm64" .
+          docker run --rm --env PYTHONPATH=/usr/local/bin --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python3 "${{ github.event.repository.name }}:test-arm64" -m unittest discover -s /workspace/tests -v
+
   publish:
     if: github.event_name != 'pull_request'
     needs: validate

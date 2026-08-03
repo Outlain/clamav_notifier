@@ -1,225 +1,407 @@
 #!/usr/bin/env python3
-"""Durable Telegram notifier for clamav-scheduled structured threat events."""
+"""Durable central Telegram delivery for ClamAV suite JSON events."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import tempfile
+import signal
+import sqlite3
+import stat
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib import error, request
 
-LOG_DIR = Path(os.environ.get("CLAMAV_LOG_DIR", "/logs"))
+EVENTS_DIR = Path(os.environ.get("EVENTS_DIR", "/events"))
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/state"))
-STATE_FILE = STATE_DIR / "notifier-state.json"
-POLL_SECONDS = max(float(os.environ.get("NOTIFIER_POLL_SECONDS", "15")), 1.0)
+DATABASE_PATH = STATE_DIR / "notifier.sqlite3"
+POLL_SECONDS = max(float(os.environ.get("NOTIFIER_POLL_SECONDS", "5")), 1.0)
 HTTP_TIMEOUT_SECONDS = max(float(os.environ.get("TELEGRAM_TIMEOUT_SECONDS", "15")), 1.0)
-REPLAY_EXISTING = os.environ.get("NOTIFIER_REPLAY_EXISTING", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+AGGREGATION_SECONDS = max(int(os.environ.get("NOTIFIER_AGGREGATION_SECONDS", "30")), 0)
+REPEAT_WINDOW_SECONDS = max(int(os.environ.get("NOTIFIER_REPEAT_WINDOW_SECONDS", "900")), 0)
+RETENTION_DAYS = max(int(os.environ.get("NOTIFIER_RETENTION_DAYS", "90")), 1)
+REJECTED_RETENTION_DAYS = max(int(os.environ.get("NOTIFIER_REJECTED_RETENTION_DAYS", "30")), 1)
+MAX_EVENT_BYTES = max(int(os.environ.get("NOTIFIER_MAX_EVENT_BYTES", "131072")), 4096)
+MAX_FILES_PER_CYCLE = max(int(os.environ.get("NOTIFIER_MAX_FILES_PER_CYCLE", "1000")), 1)
+MAX_TELEGRAM_TEXT_CHARACTERS = 4000
+MAX_HEARTBEAT_AGE_SECONDS = max(
+    int(os.environ.get("NOTIFIER_HEALTH_MAX_AGE_SECONDS", "180")), 30
+)
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-MAX_DELIVERED_IDS = 5000
+
+ALLOWED_SEVERITIES = {"info", "warning", "critical"}
+ALLOWED_FIELDS = {
+    "schema_version",
+    "event_id",
+    "event_type",
+    "service",
+    "severity",
+    "timestamp",
+    "message",
+    "source_path",
+    "destination_path",
+    "threat_name",
+    "action_success",
+    "definition_age_seconds",
+    "scan_type",
+    "job_id",
+    "torrent_hash",
+}
+IMMEDIATE_TYPES = {
+    "threat_detected",
+    "infected_content_held",
+    "infected_content_quarantined",
+    "infected_content_deleted",
+}
+INFO_NOTIFICATION_TYPES = {"service_recovered"}
+
+_stop = False
 
 
-def new_state() -> dict[str, Any]:
-    return {
-        "version": 2,
-        "initialized": False,
-        "files": {},
-        "pending": [],
-        "delivered": [],
-    }
+class TelegramRateLimited(RuntimeError):
+    def __init__(self, message: str, retry_after: int) -> None:
+        super().__init__(message)
+        self.retry_after = max(retry_after, 1)
 
 
-def load_state() -> dict[str, Any]:
+class DeliveryResult:
+    def __init__(self, message_id: str) -> None:
+        self.message_id = message_id
+
+
+def _stop_handler(_signum: int, _frame: object) -> None:
+    global _stop
+    _stop = True
+
+
+def connect_database(path: Path = DATABASE_PATH) -> sqlite3.Connection:
+    path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    previous_umask = os.umask(0o077)
     try:
-        with STATE_FILE.open("r", encoding="utf-8") as handle:
-            state = json.load(handle)
-        if not isinstance(state, dict):
-            raise ValueError("state root is not an object")
-    except FileNotFoundError:
-        return new_state()
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"[notifier] state could not be read; starting fresh: {exc}", flush=True)
-        return new_state()
-
-    defaults = new_state()
-    for key, value in defaults.items():
-        state.setdefault(key, value)
-    if not isinstance(state["files"], dict):
-        state["files"] = {}
-    if not isinstance(state["pending"], list):
-        state["pending"] = []
-    if not isinstance(state["delivered"], list):
-        state["delivered"] = []
-    return state
-
-
-def save_state(state: dict[str, Any]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".notifier-state.", suffix=".tmp", dir=STATE_DIR
-    )
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            descriptor = -1
-            json.dump(state, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, STATE_FILE)
+        connection = sqlite3.connect(path, timeout=30)
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        os.umask(previous_umask)
+    path.chmod(0o600)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT PRIMARY KEY,
+            service TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            message TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            group_key TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'suppressed')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            first_seen_at INTEGER NOT NULL,
+            sent_at INTEGER,
+            telegram_message_id TEXT,
+            last_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS events_delivery_idx
+            ON events(status, next_attempt_at, first_seen_at);
+        CREATE INDEX IF NOT EXISTS events_group_idx
+            ON events(status, group_key, first_seen_at);
+        CREATE TABLE IF NOT EXISTS rejected_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path TEXT NOT NULL,
+            rejected_at INTEGER NOT NULL,
+            error TEXT NOT NULL,
+            sample TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    connection.commit()
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
         try:
-            temporary.unlink()
+            candidate.chmod(0o600)
         except FileNotFoundError:
-            pass
+            continue
+    return connection
 
 
-def file_identity(path: Path) -> tuple[str, int]:
-    info = path.stat()
-    return f"{info.st_dev}:{info.st_ino}", info.st_size
+def _bounded_string(payload: dict[str, Any], key: str, maximum: int, required: bool = False) -> str:
+    value = payload.get(key)
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str) or (required and not value.strip()):
+        raise ValueError(f"{key} must be a non-empty string")
+    if len(value) > maximum:
+        raise ValueError(f"{key} is longer than {maximum} characters")
+    if "\x00" in value:
+        raise ValueError(f"{key} contains a NUL character")
+    return value
 
 
-def event_identifier(identity: str, offset: int, raw_line: bytes) -> str:
-    digest = hashlib.sha256()
-    digest.update(identity.encode("ascii"))
-    digest.update(b"\0")
-    digest.update(str(offset).encode("ascii"))
-    digest.update(b"\0")
-    digest.update(raw_line)
-    return digest.hexdigest()
+def validate_event(value: Any, expected_service: str | None = None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("event root must be an object")
+    if value.get("schema_version") != 1:
+        raise ValueError("unsupported schema_version")
 
-
-def parse_event(raw_line: bytes, identifier: str, log_name: str) -> dict[str, Any] | None:
+    event_id = _bounded_string(value, "event_id", 128, required=True)
+    event_type = _bounded_string(value, "event_type", 80, required=True)
+    service = _bounded_string(value, "service", 80, required=True)
+    severity = _bounded_string(value, "severity", 16, required=True).lower()
+    timestamp = _bounded_string(value, "timestamp", 64, required=True)
+    message = _bounded_string(value, "message", 2000, required=True)
+    if expected_service is not None and service != expected_service:
+        raise ValueError(f"service {service!r} does not match event directory {expected_service!r}")
+    if severity not in ALLOWED_SEVERITIES:
+        raise ValueError(f"unsupported severity {severity!r}")
+    if any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_." for character in service):
+        raise ValueError("service contains unsupported characters")
+    if any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for character in event_type):
+        raise ValueError("event_type contains unsupported characters")
+    if any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for character in event_id):
+        raise ValueError("event_id contains unsupported characters")
     try:
-        payload = json.loads(raw_line.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("event") != "threat_detected":
-        return None
+        parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("timestamp is not valid ISO-8601") from exc
+    if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset().total_seconds() != 0:
+        raise ValueError("timestamp must be in UTC")
 
-    source = payload.get("source")
-    threat = payload.get("threat")
-    if not isinstance(source, str) or not source:
-        return None
-    if not isinstance(threat, str) or not threat:
-        threat = "unknown"
-
-    return {
-        "id": identifier,
-        "scan": str(payload.get("scan") or "unknown"),
-        "threat": threat,
-        "source": source,
-        "quarantine": payload.get("quarantine"),
-        "quarantine_success": payload.get("quarantine_success"),
-        "source_log": log_name,
-        "created_at": int(time.time()),
-        "attempts": 0,
-        "next_attempt_at": 0,
+    clean: dict[str, Any] = {
+        "schema_version": 1,
+        "event_id": event_id,
+        "event_type": event_type,
+        "service": service,
+        "severity": severity,
+        "timestamp": timestamp,
+        "message": message,
     }
+    for key in ALLOWED_FIELDS - clean.keys():
+        if key not in value or value[key] is None:
+            continue
+        item = value[key]
+        if key in {"source_path", "destination_path"}:
+            clean[key] = _bounded_string(value, key, 4096)
+        elif key in {"threat_name", "scan_type", "job_id", "torrent_hash"}:
+            clean[key] = _bounded_string(value, key, 512)
+        elif key == "action_success" and isinstance(item, bool):
+            clean[key] = item
+        elif key == "definition_age_seconds" and isinstance(item, int) and item >= 0:
+            clean[key] = item
+    return clean
 
 
-def log_files() -> list[Path]:
+def parse_event(raw: bytes, expected_service: str | None = None) -> dict[str, Any]:
     try:
-        candidates = [path for path in LOG_DIR.iterdir() if path.is_file() and ".log" in path.name]
-    except FileNotFoundError:
-        return []
-    return sorted(candidates, key=lambda path: path.name)
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid JSON: {exc}") from exc
+    return validate_event(payload, expected_service=expected_service)
 
 
-def collect_events(state: dict[str, Any]) -> None:
-    paths = log_files()
-    pending_ids = {str(item.get("id")) for item in state["pending"] if isinstance(item, dict)}
-    delivered_ids = {str(item) for item in state["delivered"]}
+def _should_notify(event: dict[str, Any]) -> bool:
+    return event["severity"] != "info" or event["event_type"] in INFO_NOTIFICATION_TYPES
 
-    if not state.get("initialized"):
-        for path in paths:
-            try:
-                identity, size = file_identity(path)
-            except OSError:
-                continue
-            state["files"][identity] = {
-                "offset": 0 if REPLAY_EXISTING else size,
-                "last_path": str(path),
-            }
-        state["initialized"] = True
+
+def _group_key(event: dict[str, Any]) -> str:
+    return "\x1f".join(
+        (event["service"], event["event_type"], event["message"][:512])
+    )
+
+
+def _event_files() -> Iterable[tuple[Path, str]]:
+    try:
+        service_directories = sorted(EVENTS_DIR.iterdir(), key=lambda path: path.name)
+    except OSError:
         return
-
-    for path in paths:
+    yielded = 0
+    for directory in service_directories:
         try:
-            identity, size = file_identity(path)
+            info = directory.lstat()
         except OSError:
             continue
-
-        record = state["files"].setdefault(identity, {"offset": 0, "last_path": str(path)})
-        offset = int(record.get("offset", 0))
-        if offset < 0 or size < offset:
-            offset = 0
-
-        try:
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                while True:
-                    line_offset = handle.tell()
-                    raw_line = handle.readline()
-                    if not raw_line:
-                        break
-                    if not raw_line.endswith(b"\n"):
-                        handle.seek(line_offset)
-                        break
-                    identifier = event_identifier(identity, line_offset, raw_line)
-                    event = parse_event(raw_line.rstrip(b"\r\n"), identifier, path.name)
-                    if event and identifier not in pending_ids and identifier not in delivered_ids:
-                        state["pending"].append(event)
-                        pending_ids.add(identifier)
-                        print(
-                            f"[notifier] queued threat={event['threat']!r} source={event['source']!r}",
-                            flush=True,
-                        )
-                    offset = handle.tell()
-        except OSError as exc:
-            print(f"[notifier] could not read {path}: {exc}", flush=True)
+        if not stat.S_ISDIR(info.st_mode) or directory.name.startswith("."):
             continue
+        try:
+            paths = sorted(directory.glob("*.json"), key=lambda path: path.name)
+        except OSError:
+            continue
+        for path in paths:
+            yield path, directory.name
+            yielded += 1
+            if yielded >= MAX_FILES_PER_CYCLE:
+                return
 
-        record["offset"] = offset
-        record["last_path"] = str(path)
-        record["last_seen_at"] = int(time.time())
+
+def _read_regular_event(path: Path) -> tuple[bytes, tuple[int, int, int, int, int]]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("event is not a regular file")
+        if info.st_size > MAX_EVENT_BYTES:
+            raise ValueError(f"event exceeds {MAX_EVENT_BYTES} bytes")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, MAX_EVENT_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_EVENT_BYTES:
+                raise ValueError(f"event exceeds {MAX_EVENT_BYTES} bytes")
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+        before_identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        path_identity = (
+            path_after.st_dev,
+            path_after.st_ino,
+            path_after.st_size,
+            path_after.st_mtime_ns,
+            path_after.st_ctime_ns,
+        )
+        if before_identity != after_identity or before_identity != path_identity:
+            raise OSError("event changed while it was being read")
+        return b"".join(chunks), before_identity
+    finally:
+        os.close(descriptor)
 
 
-def render_message(event: dict[str, Any]) -> str:
-    quarantine_success = event.get("quarantine_success")
-    if quarantine_success is True:
-        quarantine_result = f"Moved to: {event.get('quarantine') or 'unknown'}"
-    elif quarantine_success is False:
-        quarantine_result = "Quarantine FAILED — inspect the source immediately"
-    else:
-        quarantine_result = "Quarantine result: unknown"
-
-    return (
-        "🚨 ClamAV malware alert\n"
-        f"Scan: {event.get('scan', 'unknown')}\n"
-        f"Threat: {event.get('threat', 'unknown')}\n"
-        f"Source: {event.get('source', 'unknown')}\n"
-        f"{quarantine_result}\n"
-        f"Log: {event.get('source_log', 'unknown')}"
+def _unlink_if_same(path: Path, identity: tuple[int, int, int, int, int]) -> None:
+    info = path.lstat()
+    current_identity = (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
     )
+    if current_identity != identity:
+        raise OSError("event changed while waiting to be removed")
+    path.unlink()
 
 
-def send_telegram(event: dict[str, Any]) -> None:
+def collect_events(connection: sqlite3.Connection) -> int:
+    imported = 0
+    now = int(time.time())
+    for path, expected_service in _event_files():
+        file_identity: tuple[int, int, int, int, int] | None = None
+        try:
+            raw, file_identity = _read_regular_event(path)
+            event = parse_event(raw, expected_service=expected_service)
+            notify = _should_notify(event)
+            initial_delay = 0 if event["event_type"] in IMMEDIATE_TYPES else AGGREGATION_SECONDS
+            group_key = _group_key(event)
+            previous = connection.execute(
+                "SELECT MAX(sent_at) AS sent_at FROM events WHERE group_key = ? AND status = 'sent'",
+                (group_key,),
+            ).fetchone()
+            next_attempt = now + initial_delay
+            if (
+                event["event_type"] not in IMMEDIATE_TYPES
+                and previous is not None
+                and previous["sent_at"] is not None
+            ):
+                next_attempt = max(next_attempt, int(previous["sent_at"]) + REPEAT_WINDOW_SECONDS)
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO events (
+                    event_id, service, event_type, severity, message, payload,
+                    group_key, status, next_attempt_at, first_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event["event_id"],
+                    event["service"],
+                    event["event_type"],
+                    event["severity"],
+                    event["message"],
+                    json.dumps(event, separators=(",", ":"), sort_keys=True),
+                    group_key,
+                    "pending" if notify else "suppressed",
+                    next_attempt,
+                    now,
+                ),
+            )
+            connection.commit()
+            _unlink_if_same(path, file_identity)
+            imported += 1
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, OSError) and "changed while" in str(exc):
+                continue
+            connection.execute(
+                "INSERT INTO rejected_events(source_path, rejected_at, error, sample) VALUES (?, ?, ?, ?)",
+                (str(path), now, str(exc)[:2000], ""),
+            )
+            connection.commit()
+            try:
+                rejected_identity = file_identity
+                if rejected_identity is None:
+                    info = path.lstat()
+                    rejected_identity = (
+                        info.st_dev,
+                        info.st_ino,
+                        info.st_size,
+                        info.st_mtime_ns,
+                        info.st_ctime_ns,
+                    )
+                _unlink_if_same(path, rejected_identity)
+            except OSError:
+                pass
+            print(f"[notifier] rejected {path}: {exc}", file=sys.stderr, flush=True)
+    return imported
+
+
+def render_message(event: dict[str, Any], repeat_count: int = 1) -> str:
+    severity_icon = {"critical": "🚨", "warning": "⚠️", "info": "✅"}
+    lines = [
+        f"{severity_icon.get(event['severity'], 'ℹ️')} ClamAV: {event['event_type']}",
+        f"Service: {event['service']}",
+        event["message"],
+    ]
+    if event.get("threat_name"):
+        lines.append(f"Threat: {event['threat_name']}")
+    if event.get("source_path"):
+        lines.append(f"Source: {event['source_path']}")
+    if event.get("destination_path"):
+        lines.append(f"Destination: {event['destination_path']}")
+    if repeat_count > 1:
+        lines.append(f"Occurrences combined: {repeat_count}")
+    lines.append(f"Time: {event['timestamp']}")
+    rendered = "\n".join(lines)
+    if len(rendered) > MAX_TELEGRAM_TEXT_CHARACTERS:
+        rendered = rendered[: MAX_TELEGRAM_TEXT_CHARACTERS - 3] + "..."
+    return rendered
+
+
+def _telegram_retry_after(payload: Any, default: int = 60) -> int:
+    if isinstance(payload, dict):
+        parameters = payload.get("parameters")
+        if isinstance(parameters, dict):
+            value = parameters.get("retry_after")
+            if isinstance(value, int) and value > 0:
+                return value
+    return default
+
+
+def send_telegram(text: str) -> DeliveryResult:
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required")
-    body = json.dumps({"chat_id": CHAT_ID, "text": render_message(event)}).encode("utf-8")
+    body = json.dumps({"chat_id": CHAT_ID, "text": text}).encode("utf-8")
     http_request = request.Request(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         data=body,
@@ -230,73 +412,189 @@ def send_telegram(event: dict[str, Any]) -> None:
         with request.urlopen(http_request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             response_body = response.read(1024 * 1024)
     except error.HTTPError as exc:
-        details = exc.read(4096).decode("utf-8", "replace")
-        raise RuntimeError(f"Telegram HTTP {exc.code}: {details}") from exc
-    payload = json.loads(response_body.decode("utf-8"))
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        raise RuntimeError("Telegram API returned ok=false")
-
-
-def deliver_pending(state: dict[str, Any]) -> None:
-    now = int(time.time())
-    for event in list(state["pending"]):
-        if not isinstance(event, dict) or int(event.get("next_attempt_at", 0)) > now:
-            continue
+        details = exc.read(65536)
         try:
-            send_telegram(event)
-        except Exception as exc:
-            attempts = int(event.get("attempts", 0)) + 1
-            event["attempts"] = attempts
-            event["last_error"] = str(exc)
-            event["next_attempt_at"] = now + min(3600, 30 * (2 ** min(attempts - 1, 7)))
-            print(f"[notifier] delivery failed; retry scheduled: {exc}", flush=True)
-            save_state(state)
-            continue
+            payload = json.loads(details.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
+        if exc.code == 429:
+            raise TelegramRateLimited("Telegram rate limit", _telegram_retry_after(payload)) from exc
+        description = payload.get("description") if isinstance(payload, dict) else None
+        raise RuntimeError(f"Telegram HTTP {exc.code}: {description or 'request failed'}") from exc
+    try:
+        payload = json.loads(response_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Telegram returned invalid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        if isinstance(payload, dict) and payload.get("error_code") == 429:
+            raise TelegramRateLimited(
+                "Telegram rate limit", _telegram_retry_after(payload)
+            )
+        raise RuntimeError("Telegram API returned ok=false")
+    result = payload.get("result")
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    if not isinstance(message_id, (int, str)):
+        raise RuntimeError("Telegram response did not include a message id")
+    return DeliveryResult(message_id=str(message_id))
 
-        state["pending"].remove(event)
-        state["delivered"].append(event["id"])
-        state["delivered"] = state["delivered"][-MAX_DELIVERED_IDS:]
-        save_state(state)
-        print(f"[notifier] alert delivered id={event['id']}", flush=True)
+
+def _delivery_group(connection: sqlite3.Connection, first: sqlite3.Row) -> list[sqlite3.Row]:
+    if first["event_type"] in IMMEDIATE_TYPES:
+        return [first]
+    return list(
+        connection.execute(
+            """
+            SELECT * FROM events
+            WHERE status = 'pending' AND group_key = ? AND first_seen_at <= ?
+            ORDER BY first_seen_at, event_id LIMIT 1000
+            """,
+            (first["group_key"], int(time.time())),
+        )
+    )
+
+
+def deliver_pending(connection: sqlite3.Connection) -> bool:
+    now = int(time.time())
+    first = connection.execute(
+        """
+        SELECT * FROM events
+        WHERE status = 'pending' AND next_attempt_at <= ?
+        ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                 first_seen_at, event_id
+        LIMIT 1
+        """,
+        (now,),
+    ).fetchone()
+    if first is None:
+        return False
+    rows = _delivery_group(connection, first)
+    event = json.loads(first["payload"])
+    identifiers = [row["event_id"] for row in rows]
+    placeholders = ",".join("?" for _ in identifiers)
+    try:
+        result = send_telegram(render_message(event, repeat_count=len(rows)))
+    except Exception as exc:
+        attempts = max(int(row["attempts"]) for row in rows) + 1
+        if isinstance(exc, TelegramRateLimited):
+            retry_at = now + exc.retry_after
+        else:
+            retry_at = now + min(3600, 30 * (2 ** min(attempts - 1, 7)))
+        connection.execute(
+            f"""
+            UPDATE events SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?
+            WHERE event_id IN ({placeholders})
+            """,
+            (retry_at, str(exc)[:2000], *identifiers),
+        )
+        connection.commit()
+        print(f"[notifier] delivery failed; retry scheduled: {exc}", file=sys.stderr, flush=True)
+        return False
+
+    connection.execute(
+        f"""
+        UPDATE events
+        SET status = 'sent', sent_at = ?, telegram_message_id = ?, last_error = NULL
+        WHERE event_id IN ({placeholders})
+        """,
+        (now, result.message_id, *identifiers),
+    )
+    connection.commit()
+    print(
+        f"[notifier] delivered {len(identifiers)} event(s), message_id={result.message_id}",
+        flush=True,
+    )
+    return True
+
+
+def record_heartbeat(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES ('heartbeat', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(int(time.time())),),
+    )
+    connection.commit()
+
+
+def prune_history(connection: sqlite3.Connection) -> None:
+    now = int(time.time())
+    last = connection.execute(
+        "SELECT value FROM metadata WHERE key='last_prune'"
+    ).fetchone()
+    if last is not None and now - int(last["value"]) < 86400:
+        return
+    event_cutoff = now - RETENTION_DAYS * 86400
+    rejected_cutoff = now - REJECTED_RETENTION_DAYS * 86400
+    connection.execute(
+        "DELETE FROM events WHERE status IN ('sent', 'suppressed') AND first_seen_at < ?",
+        (event_cutoff,),
+    )
+    connection.execute("DELETE FROM rejected_events WHERE rejected_at < ?", (rejected_cutoff,))
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES ('last_prune', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(now),),
+    )
+    connection.commit()
 
 
 def healthcheck() -> int:
     try:
         if not BOT_TOKEN or not CHAT_ID:
             raise RuntimeError("Telegram credentials are missing")
-        if not LOG_DIR.is_dir() or not os.access(LOG_DIR, os.R_OK | os.X_OK):
-            raise RuntimeError(f"log directory is not readable: {LOG_DIR}")
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        probe = STATE_DIR / ".health-write-probe"
-        probe.write_text("ok\n", encoding="ascii")
-        probe.unlink()
+        if not EVENTS_DIR.is_dir() or not os.access(EVENTS_DIR, os.R_OK | os.X_OK):
+            raise RuntimeError(f"event directory is not readable: {EVENTS_DIR}")
+        connection = connect_database()
+        try:
+            connection.execute("SELECT 1").fetchone()
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='heartbeat'"
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            raise RuntimeError("notifier heartbeat is missing")
+        if int(time.time()) - int(row["value"]) > MAX_HEARTBEAT_AGE_SECONDS:
+            raise RuntimeError("notifier heartbeat is stale")
         print("healthy")
         return 0
-    except (OSError, RuntimeError) as exc:
-        print(f"unhealthy: {exc}")
+    except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+        print(f"unhealthy: {exc}", file=sys.stderr)
         return 1
 
 
+def interruptible_sleep(seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while not _stop and time.monotonic() < deadline:
+        time.sleep(min(0.5, deadline - time.monotonic()))
+
+
 def main() -> int:
-    if "--healthcheck" in os.sys.argv:
+    if "--healthcheck" in sys.argv:
         return healthcheck()
     if not BOT_TOKEN or not CHAT_ID:
-        print("[notifier] Telegram credentials are required", flush=True)
+        print("[notifier] Telegram credentials are required", file=sys.stderr, flush=True)
         return 2
-
-    state = load_state()
-    print(
-        f"[notifier] started log_dir={LOG_DIR} replay_existing={REPLAY_EXISTING}",
-        flush=True,
-    )
-    while True:
-        try:
-            collect_events(state)
-            save_state(state)
-            deliver_pending(state)
-        except Exception as exc:
-            print(f"[notifier] cycle failed: {exc}", flush=True)
-        time.sleep(POLL_SECONDS)
+    signal.signal(signal.SIGTERM, _stop_handler)
+    signal.signal(signal.SIGINT, _stop_handler)
+    connection = connect_database()
+    print(f"[notifier] started events={EVENTS_DIR} database={DATABASE_PATH}", flush=True)
+    try:
+        while not _stop:
+            try:
+                imported = collect_events(connection)
+                record_heartbeat(connection)
+                prune_history(connection)
+                delivered = deliver_pending(connection)
+                if imported:
+                    print(f"[notifier] imported {imported} event file(s)", flush=True)
+                if delivered:
+                    continue
+            except Exception as exc:
+                print(f"[notifier] cycle failed: {exc}", file=sys.stderr, flush=True)
+            interruptible_sleep(POLL_SECONDS)
+    finally:
+        connection.close()
+    return 0
 
 
 if __name__ == "__main__":
